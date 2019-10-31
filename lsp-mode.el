@@ -627,8 +627,7 @@ Changes take effect only when a new session is started."
                                         (csharp-mode . "csharp")
                                         (plain-tex-mode . "plaintex")
                                         (latex-mode . "latex")
-                                        (vhdl-mode . "vhdl")
-                                        (terraform-mode . "terraform"))
+                                        (vhdl-mode . "vhdl"))
   "Language id configuration.")
 
 (defvar lsp-method-requirements

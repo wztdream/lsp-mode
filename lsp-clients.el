@@ -44,7 +44,6 @@
 (require 'lsp-haxe)
 (require 'lsp-vhdl)
 (require 'lsp-yaml)
-(require 'lsp-terraform)
 
 ;;; Ada
 (defgroup lsp-ada nil
