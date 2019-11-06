@@ -762,8 +762,6 @@ They are added to `markdown-code-lang-modes'")
 (defvar-local lsp--link-overlays nil
   "A list of overlays that display document links.")
 
-(defvar-local lsp--links-idle-timer nil)
-
 (defvar lsp--session nil
   "Contain the `lsp-session' for the current Emacs instance.")
 
@@ -1379,7 +1377,7 @@ already have been created."
 (defmacro lsp-foreach-workspace (&rest body)
   "Execute BODY for each of the current workspaces."
   (declare (debug (form body)))
-  `(--map (with-lsp-workspace it ,@body) (lsp-workspaces)))
+  `(--each (lsp-workspaces) (with-lsp-workspace it ,@body)))
 
 (defmacro when-lsp-workspace (workspace &rest body)
   "Helper macro for invoking BODY in WORKSPACE context if present."
@@ -1536,33 +1534,33 @@ WORKSPACE is the workspace that contains the diagnostics."
       "Report new diagnostics to flymake."
       (funcall lsp--flymake-report-fn
                (-some->> (lsp-diagnostics)
-                 (gethash buffer-file-name)
-                 (--map (-let* (((&hash "message" "severity" "range") (lsp-diagnostic-original it))
-                                ((start . end) (lsp--range-to-region range)))
-                          (when (= start end)
-                            (-let (((&hash "line" start-line "character") (gethash "start" range)))
-                              (if-let ((region (and (fboundp 'flymake-diag-region)
-                                                    (flymake-diag-region (current-buffer)
-                                                                         (1+ start-line)
-                                                                         character))))
-                                  (setq start (car region)
-                                        end (cdr region))
-                                (save-excursion
-                                  (save-restriction
-                                    (widen)
-                                    (goto-char (point-min))
-                                    (-let (((&hash "line" end-line) (gethash "end" range)))
-                                      (setq start (point-at-bol (1+ start-line))
-                                            end (point-at-eol (1+ end-line)))))))))
-                          (and (fboundp 'flymake-make-diagnostic)
-                           (flymake-make-diagnostic (current-buffer)
-                                                   start
-                                                   end
-                                                   (cl-case severity
-                                                     (1 :error)
-                                                     (2 :warning)
-                                                     (t :note))
-                                                   message)))))
+                         (gethash buffer-file-name)
+                         (--map (-let* (((&hash "message" "severity" "range") (lsp-diagnostic-original it))
+                                        ((start . end) (lsp--range-to-region range)))
+                                  (when (= start end)
+                                    (-let (((&hash "line" start-line "character") (gethash "start" range)))
+                                      (if-let ((region (and (fboundp 'flymake-diag-region)
+                                                            (flymake-diag-region (current-buffer)
+                                                                                 (1+ start-line)
+                                                                                 character))))
+                                          (setq start (car region)
+                                                end (cdr region))
+                                        (save-excursion
+                                          (save-restriction
+                                            (widen)
+                                            (goto-char (point-min))
+                                            (-let (((&hash "line" end-line) (gethash "end" range)))
+                                              (setq start (point-at-bol (1+ start-line))
+                                                    end (point-at-eol (1+ end-line)))))))))
+                                  (and (fboundp 'flymake-make-diagnostic)
+                                       (flymake-make-diagnostic (current-buffer)
+                                                                start
+                                                                end
+                                                                (cl-case severity
+                                                                  (1 :error)
+                                                                  (2 :warning)
+                                                                  (t :note))
+                                                                message)))))
                ;; This :region keyword forces flymake to delete old diagnostics in
                ;; case the buffer hasn't changed since the last call to the report
                ;; function. See https://github.com/joaotavora/eglot/issues/159
@@ -2851,6 +2849,7 @@ in that particular folder."
     (add-function :before-until (local 'eldoc-documentation-function) #'lsp-eldoc-function)
     (eldoc-mode 1)
     (add-hook 'after-change-functions #'lsp-on-change nil t)
+    (add-hook 'after-change-functions #'lsp--after-change nil t)
     (add-hook 'after-revert-hook #'lsp-on-revert nil t)
     (add-hook 'after-save-hook #'lsp-on-save nil t)
     (add-hook 'auto-save-hook #'lsp--on-auto-save nil t)
@@ -2861,15 +2860,18 @@ in that particular folder."
       (add-hook 'completion-at-point-functions #'lsp-completion-at-point nil t))
     (add-hook 'kill-buffer-hook #'lsp--text-document-did-close nil t)
     (add-hook 'post-self-insert-hook #'lsp--on-self-insert nil t)
-    (add-hook 'post-command-hook #'lsp--highlight nil t)
+    (add-hook 'post-command-hook #'lsp--cleanup-highlights-if-needed nil t)
+    (add-hook 'lsp-idle-hook #'lsp--do-highlights nil t)
+    (lsp--on-idle (current-buffer))
     (when lsp-enable-xref
       (add-hook 'xref-backend-functions #'lsp--xref-backend nil t)))
    (t
     (setq-local indent-region-function nil)
     (remove-function (local 'eldoc-documentation-function) #'lsp-eldoc-function)
 
-    (remove-hook 'post-command-hook #'lsp--highlight t)
+    (remove-hook 'post-command-hook #'lsp--cleanup-highlights-if-needed t)
     (remove-hook 'after-change-functions #'lsp-on-change t)
+    (remove-hook 'after-change-functions #'lsp--after-change t)
     (remove-hook 'after-revert-hook #'lsp-on-revert t)
     (remove-hook 'after-save-hook #'lsp-on-save t)
     (remove-hook 'auto-save-hook #'lsp--on-auto-save t)
@@ -2878,7 +2880,12 @@ in that particular folder."
     (remove-hook 'completion-at-point-functions #'lsp-completion-at-point t)
     (remove-hook 'kill-buffer-hook #'lsp--text-document-did-close t)
     (remove-hook 'post-self-insert-hook #'lsp--on-self-insert t)
-    (lsp--cancel-document-link-timer)
+
+    (remove-hook 'lsp-idle-hook #'lsp--do-highlights t)
+
+    (when lsp--on-idle-timer (cancel-timer lsp--on-idle-timer))
+
+    ;; cleanup semantic highlight
     (save-restriction
       (widen)
       (remove-overlays (point-min) (point-max) 'lsp-sem-highlight t)))
@@ -3353,6 +3360,73 @@ Added to `after-change-functions'."
   ;; force cleanup overlays after each change
   (lsp-foreach-workspace (lsp--remove-cur-overlays)))
 
+
+
+;; facilities for on change hooks. We do not want to make lsp calls on each
+;; change event so we add debounce to avoid flooding the server with events.
+;; Additionally, we want to have a mechanism for stopping the server calls in
+;; particular cases like, e. g. when performing completion.
+
+(defvar lsp-inhibit-on-change-hooks nil
+  "Flag to control.")
+
+(defvar lsp--on-change-timer nil)
+(defvar lsp--on-idle-timer nil)
+
+(defcustom lsp-debounced-on-change-hook nil
+  "Hooks to run when buffer has changed."
+  :type 'hook
+  :group 'lsp-mode)
+
+(defcustom lsp-debounced-on-change-interval 0.500
+  "Debounce interval for `after-change-functions'. "
+  :type 'number
+  :group 'lsp-mode)
+
+(defcustom lsp-idle-hook nil
+  "Hooks to run "
+  :type 'hook
+  :group 'lsp-mode)
+
+(defun lsp--idle-reschedule (buffer)
+  (setq-local lsp--on-idle-timer (run-with-idle-timer
+                                  lsp-debounced-on-change-interval
+                                  nil
+                                  #'lsp--on-idle
+                                  buffer)))
+
+(defun lsp--on-idle (buffer)
+  "Start post command loop."
+  (when (buffer-live-p buffer)
+    (unless lsp-inhibit-on-change-hooks
+      (run-hooks 'lsp-idle-hook))
+    (lsp--idle-reschedule buffer)))
+
+(defun lsp--on-change-debounce (buffer)
+  (when (and (buffer-live-p buffer)
+             (not lsp-inhibit-on-change-hooks))
+    (unless lsp-inhibit-on-change-hooks
+      (run-hooks 'lsp-debounced-on-change-hook))))
+
+(add-hook 'lsp-on-change (lambda () (message "lsp-on-change")))
+(add-hook 'lsp-debounced-on-change-hook (lambda () (message "lsp-debounced-on-change-hook")))
+
+(defun lsp--after-change (&rest _)
+  (when lsp--on-change-timer
+    (cancel-timer lsp--on-change-timer))
+
+  (when lsp--on-idle-timer
+    (cancel-timer lsp--on-idle-timer))
+
+  (setq-local lsp--on-change-timer (run-with-idle-timer
+                                    lsp-debounced-on-change-interval
+                                    nil
+                                    #'lsp--on-change-debounce
+                                    (current-buffer)))
+  (lsp--idle-reschedule (current-buffer)))
+
+
+
 (defun lsp--on-self-insert ()
   "Self insert handling.
 Applies on type formatting."
@@ -3368,18 +3442,15 @@ Applies on type formatting."
                            (lambda (edits)
                              (when (= tick (buffer-chars-modified-tick)) (lsp--apply-text-edits edits))))))))
 
+
+;; links
 (defun lsp--set-document-link-timer ()
-  (lsp--cancel-document-link-timer)
-  (when (and lsp-enable-links (lsp--capability "documentLinkProvider"))
-    (setq-local lsp--links-idle-timer (run-with-idle-timer
-                                       lsp-links-check-internal nil
-                                       #'lsp--update-document-links
-                                       (current-buffer)))))
-
-(defun lsp--cancel-document-link-timer ()
-  (when lsp--links-idle-timer
-    (cancel-timer lsp--links-idle-timer)
-    (setq-local lsp--links-idle-timer nil)))
+  ;; (when (and lsp-enable-links (lsp--capability "documentLinkProvider"))
+  ;;   (setq-local lsp--links-idle-timer (run-with-idle-timer
+  ;;                                      lsp-links-check-internal nil
+  ;;                                      #'lsp--update-document-links
+  ;;                                      (current-buffer))))
+  )
 
 (defun lsp--update-document-links (&optional buffer)
   (when (or (not buffer) (eq (current-buffer) buffer))
@@ -3445,6 +3516,8 @@ Applies on type formatting."
            link
            (-lambda ((&hash "target"))
              (lsp--document-link-handle-target target))))))))
+
+
 
 (defun lsp-buffer-language ()
   "Get language corresponding current buffer."
@@ -3699,10 +3772,9 @@ If INCLUDE-DECLARATION is non-nil, request the server to include declarations."
 
 (defun lsp--cancel-request (id)
   "Cancel request with ID in all workspaces."
-  (--each (lsp-workspaces)
-    (with-lsp-workspace it
-      (->> lsp--cur-workspace lsp--workspace-client lsp--client-response-handlers (remhash id))
-      (lsp-notify "$/cancelRequest" `(:id ,id)))))
+  (lsp-foreach-workspace
+   (->> lsp--cur-workspace lsp--workspace-client lsp--client-response-handlers (remhash id))
+   (lsp-notify "$/cancelRequest" `(:id ,id))))
 
 (defun lsp-eldoc-function ()
   "`lsp-mode' eldoc function."
@@ -3715,34 +3787,35 @@ If INCLUDE-DECLARATION is non-nil, request the server to include declarations."
      nil))
   eldoc-last-message)
 
-(defvar-local lsp--highlight-bounds nil)
-(defvar-local lsp--highlight-timer nil)
+(defun dash-expand:&lsp-wks (key source)
+  `(,(intern-soft (format "lsp--workspace-%s" (eval key) )) ,source))
 
-(defun lsp--highlight ()
-  (let ((buff (current-buffer)))
-    (with-demoted-errors "Error in ‘lsp--highlight’: %S"
-      (when (and lsp-enable-symbol-highlighting
-                 (lsp--capability "documentHighlightProvider"))
-        (let ((bounds (bounds-of-thing-at-point 'symbol))
-              (last lsp--highlight-bounds)
-              (point (point)))
-          (when (and last (or (< point (car last)) (> point (cdr last))))
-            (setq lsp--highlight-bounds nil)
-            (--each (lsp-workspaces)
-              (with-lsp-workspace it
-                (lsp--remove-cur-overlays))))
-          (when (and bounds (not (equal last bounds)))
-            (and lsp--highlight-timer (cancel-timer lsp--highlight-timer))
-            (setq lsp--highlight-timer
-                  (run-with-idle-timer
-                   lsp-document-highlight-delay nil
-                   (lambda nil
-                     (when (and (eq buff (current-buffer))
-                                lsp-enable-symbol-highlighting
-                                (lsp--capability "documentHighlightProvider"))
-                       (setq lsp--highlight-bounds
-                             (bounds-of-thing-at-point 'symbol))
-                       (lsp--document-highlight)))))))))))
+(defun lsp--point-on-highlight? ()
+  (let ((point (point)))
+    (-any?
+     (-lambda ((&lsp-wks 'highlight-overlays overlays))
+       (-some? (lambda (overlay)
+                 (<=
+                  (overlay-start overlay)
+                  point
+                  (overlay-end overlay)))
+               (gethash (current-buffer) overlays)))
+     (lsp-workspaces))))
+
+
+(defun lsp--cleanup-highlights-if-needed ()
+  (when (and lsp-enable-symbol-highlighting
+             (not (lsp--point-on-highlight?)))
+    (lsp-foreach-workspace (lsp--remove-cur-overlays))))
+
+(defun lsp--do-highlights ()
+  (unless (or (looking-at "[[:space:]\n]")
+              (lsp--point-on-highlight?))
+    (lsp-request-async "textDocument/documentHighlight"
+                       (lsp--text-document-position-params)
+                       (apply-partially #'lsp--document-highlight-callback
+                                        (current-buffer))
+     :mode 'tick)))
 
 (defun lsp-describe-thing-at-point ()
   "Display the type signature and documentation of the thing at
@@ -4106,11 +4179,6 @@ interface DocumentRangeFormattingParams {
       (delete-overlay overlay))
     (remhash buf overlays)))
 
-(defun lsp--document-highlight ()
-  (lsp-request-async "textDocument/documentHighlight"
-                     (lsp--text-document-position-params)
-                     (lsp--make-document-highlight-callback (current-buffer))))
-
 (defun lsp-document-highlight ()
   "Highlight all relevant references to the symbol under point."
   (interactive)
@@ -4118,50 +4186,40 @@ interface DocumentRangeFormattingParams {
     (signal 'lsp-capability-not-supported (list "documentHighlightProvider")))
   (lsp--document-highlight))
 
-(defun lsp--make-document-highlight-callback (buf)
+(defun lsp--document-highlight-callback (buf highlights)
   "Create a callback to process the reply of a
 'textDocument/documentHighlight' message for the buffer BUF.
 A reference is highlighted only if it is visible in a window."
-  (cl-check-type buf buffer)
-  (lambda (highlights)
-    (with-current-buffer buf
-      (lsp--remove-cur-overlays)
-      (when (/= (seq-length highlights) 0)
-        (let* ((windows-on-buffer (get-buffer-window-list nil nil 'visible))
-               (overlays (lsp--workspace-highlight-overlays lsp--cur-workspace))
-               (buf-overlays (gethash (current-buffer) overlays))
-               wins-visible-pos)
-          (save-restriction
-            (widen)
-            ;; Save visible portions of the buffer
-            (dolist (win windows-on-buffer)
-              (let* ((win-start (window-start win))
-                     (win-end (window-end win)))
-                (push (cons (1- (line-number-at-pos win-start))
-                            (1+ (line-number-at-pos win-end)))
-                      wins-visible-pos)))
-            (seq-doseq (highlight highlights)
-              (let* ((range (gethash "range" highlight nil))
-                     (kind (gethash "kind" highlight 1))
-                     (start (gethash "start" range))
-                     (end (gethash "end" range))
-                     overlay)
-                (dolist (win wins-visible-pos)
-                  (let* ((start-window (car win))
-                         (end-window (cdr win)))
-                    ;; Make the overlay only if the reference is visible
-                    (when (and (> (1+ (gethash "line" start)) start-window)
-                               (< (1+ (gethash "line" end)) end-window)
-                               (not (and lsp-symbol-highlighting-skip-current
-                                         (<= (lsp--position-to-point start)
-                                             (point)
-                                             (lsp--position-to-point end)))))
-                      (setq overlay (make-overlay (lsp--position-to-point start)
-                                                  (lsp--position-to-point end)))
-                      (overlay-put overlay 'face
-                                   (cdr (assq kind lsp--highlight-kind-face)))
-                      (push overlay buf-overlays)
-                      (puthash (current-buffer) buf-overlays overlays))))))))))))
+  (with-current-buffer buf
+    (unless (lsp--point-on-highlight?)
+      (let* ((overlays (lsp--workspace-highlight-overlays lsp--cur-workspace))
+             (buf-overlays (gethash buf overlays))
+             (wins-visible-pos (-map (lambda (win)
+                                       (cons (1- (line-number-at-pos (window-start win)))
+                                             (1+ (line-number-at-pos (window-end win)))))
+                                     (get-buffer-window-list nil nil 'visible)))
+             (position (lsp--point-to-position (point))))
+        (seq-doseq (highlight highlights)
+          (let* ((range (gethash "range" highlight))
+                 (kind (gethash "kind" highlight 1))
+                 (start (gethash "start" range))
+                 (end (gethash "end" range))
+                 overlay)
+            (-each wins-visible-pos
+              (-lambda ((start-window . end-window))
+                ;; Make the overlay only if the reference is visible
+                (when (and (> (1+ (gethash "line" start)) start-window)
+                           (< (1+ (gethash "line" end)) end-window)
+                           (not (and lsp-symbol-highlighting-skip-current
+                                     (<= (lsp--position-to-point start)
+                                         (point)
+                                         (lsp--position-to-point end)))))
+                  (setq overlay (make-overlay (lsp--position-to-point start)
+                                              (lsp--position-to-point end)))
+                  (overlay-put overlay 'face
+                               (cdr (assq kind lsp--highlight-kind-face)))
+                  (push overlay buf-overlays)
+                  (puthash buf buf-overlays overlays))))))))))
 
 (defface lsp-face-semhl-variable-parameter
   '((t :inherit font-lock-variable-name-face))
@@ -6084,15 +6142,15 @@ This avoids overloading the server with many files when starting Emacs."
 (defmacro lsp-with-cached-filetrue-name (&rest body)
   "Executes BODY caching the `file-truename' calls."
   `(let ((old-fn (symbol-function 'file-truename)))
-    (unwind-protect
-        (progn
-          (fset 'file-truename
-                (lambda (file-name &optional counter prev-dirs)
-                  (or (gethash file-name lsp-file-truename-cache)
-                      (puthash file-name (apply old-fn (list file-name counter prev-dirs))
-                               lsp-file-truename-cache))))
-          ,@body)
-      (fset 'file-truename old-fn))))
+     (unwind-protect
+         (progn
+           (fset 'file-truename
+                 (lambda (file-name &optional counter prev-dirs)
+                   (or (gethash file-name lsp-file-truename-cache)
+                       (puthash file-name (apply old-fn (list file-name counter prev-dirs))
+                                lsp-file-truename-cache))))
+           ,@body)
+       (fset 'file-truename old-fn))))
 
 
 ;; avy integration
